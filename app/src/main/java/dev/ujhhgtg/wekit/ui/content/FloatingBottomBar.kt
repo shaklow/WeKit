@@ -204,6 +204,10 @@ fun <T> FloatingBottomBar(
     colors: FloatingBottomBarColors = FloatingBottomBarDefaults.colors(),
     iconContent: @Composable (item: T, index: Int) -> Unit,
     labelContent: @Composable (item: T, index: Int) -> Unit,
+    // Fired for every tap on the bar (any tab), with the tapped tab's index — unlike
+    // onSelectedTabTap, which only fires when the already-selected tab is re-tapped.
+    // Runs before onSelectedTabTap, so a re-tap invokes both.
+    onTabTap: ((index: Int) -> Unit)? = null,
     onSelectedTabTap: ((index: Int) -> Unit)? = null,
     onTabLongPress: ((index: Int) -> Boolean)? = null,
     liquidGlassBlurRadius: Dp = 4.dp,
@@ -243,6 +247,7 @@ fun <T> FloatingBottomBar(
     var currentIndex by remember { mutableIntStateOf(selectedIndex()) }
     val selectedIndexUpdated by rememberUpdatedState(selectedIndex)
     val onSelectedUpdated by rememberUpdatedState(onSelected)
+    val onTabTapUpdated by rememberUpdatedState(onTabTap)
     val onSelectedTabTapUpdated by rememberUpdatedState(onSelectedTabTap)
     val onTabLongPressUpdated by rememberUpdatedState(onTabLongPress)
     val gestureIndices = remember { IntArray(2) }
@@ -302,6 +307,7 @@ fun <T> FloatingBottomBar(
                 }
             },
             onTap = {
+                onTabTapUpdated?.invoke(gestureIndices[1])
                 if (gestureIndices[1] == gestureIndices[0]) {
                     onSelectedTabTapUpdated?.invoke(gestureIndices[1])
                 }

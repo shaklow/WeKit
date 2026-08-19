@@ -553,9 +553,15 @@ object ReplaceNavigationBar : ClickableFeature(), IResolveDex {
                                             contentColor = inactiveColor,
                                             activeContentColor = activeColor
                                         ),
+                                        // Per-tap haptic, matching WeChat's own tab bar. This restores
+                                        // the vibration every tab tap had via FloatingBottomBarItem's
+                                        // onClick before the upstream sync dropped it; taps on other
+                                        // tabs only surface here, not through onSelectedTabTap.
+                                        onTabTap = { _ ->
+                                            view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                                        },
                                         onSelectedTabTap = { index ->
                                             if (visibleTabItems[index].wechatIndex == 0) {
-                                                view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
                                                 onTabClicked(index)
                                             }
                                         },
