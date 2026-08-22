@@ -135,6 +135,7 @@ object ReplaceNavigationBar : ClickableFeature(), IResolveDex {
     private var showFinderBadge by prefOption("nav_bar_show_finder_badge", true)
     private var hideLabels by prefOption("nav_bar_hide_labels", false)
     private var blurRadius by prefOption("nav_bar_blur_radius", 8)
+    private var dynamicGravityHighlight by prefOption("nav_bar_dynamic_gravity_highlight", false)
     private var barScalePercent by prefOption("nav_bar_scale", 100)
     private var tabOrder by prefOption("nav_bar_tab_order", TAB_ITEMS.joinToString(",") { it.wechatIndex.toString() })
     private var enabledTabs by prefOption("nav_bar_enabled_tabs", TAB_ITEMS.map { it.wechatIndex.toString() }.toSet())
@@ -298,6 +299,7 @@ object ReplaceNavigationBar : ClickableFeature(), IResolveDex {
                     type = "com.tencent.mm.ui.MMFragmentActivity"
                 }
                 .get()!! as Activity
+            val lifecycleOwner = LifecycleOwnerProvider.getOrCreate(activity)
             val viewPager = thisObject!!.reflekt()
                 .firstField {
                     name = "mViewPager"
@@ -352,7 +354,6 @@ object ReplaceNavigationBar : ClickableFeature(), IResolveDex {
                 }
             }
 
-            val lifecycleOwner = LifecycleOwnerProvider.lifecycleOwner
             bottomTabViewGroup.setLifecycleOwner(lifecycleOwner)
 
             val initialPagerIndex = viewPager.currentItem
@@ -385,6 +386,7 @@ object ReplaceNavigationBar : ClickableFeature(), IResolveDex {
             val useBackdrop = useBackdrop
             val showFinderBadge = showFinderBadge
             val hideLabels = hideLabels
+            val dynamicGravityHighlight = dynamicGravityHighlight
             val barScale = barScalePercent.coerceIn(MIN_BAR_SCALE, MAX_BAR_SCALE) / 100f
 
             val composeView = ComposeView(activity).apply {
@@ -541,7 +543,7 @@ object ReplaceNavigationBar : ClickableFeature(), IResolveDex {
                                         // Sample WeChat's real content (native ViewPager) into the
                                         // glass. rememberLayerBackdrop would only capture Compose
                                         // pixels, of which there are none behind this overlay bar.
-                                        backdrop = rememberViewBackdrop(viewPager),
+                                        backdrop = rememberViewBackdrop(viewPager, lifecycleOwner),
                                         mode = if (useBackdrop) {
                                             FloatingBottomBarMode.LiquidGlass
                                         } else {
@@ -574,6 +576,7 @@ object ReplaceNavigationBar : ClickableFeature(), IResolveDex {
                                             }
                                         },
                                         liquidGlassBlurRadius = blurRadius.dp,
+                                        dynamicGravityHighlight = dynamicGravityHighlight,
                                         iconContent = { item, index ->
                                             val label = stringResource(item.labelRes)
                                             // Key the fill crossfade to the target page (the same
@@ -756,6 +759,7 @@ object ReplaceNavigationBar : ClickableFeature(), IResolveDex {
             var showFinderBadgeInput by remember { mutableStateOf(showFinderBadge) }
             var hideLabelsInput by remember { mutableStateOf(hideLabels) }
             var blurRadiusInput by remember { mutableFloatStateOf(blurRadius.toFloat()) }
+            var dynamicGravityHighlightInput by remember { mutableStateOf(dynamicGravityHighlight) }
             var barScaleInput by remember {
                 mutableFloatStateOf(barScalePercent.coerceIn(MIN_BAR_SCALE, MAX_BAR_SCALE).toFloat())
             }
@@ -803,43 +807,50 @@ object ReplaceNavigationBar : ClickableFeature(), IResolveDex {
                                     },
                                 )
                             }
-                            expandableItem(
-                                expanded = useBackdropInput,
-                                topContent = {
-                                    SwitchWidget(
-                                        iconPlaceholder = false,
-                                        title = stringResource(R.string.nav_use_liquid_glass),
-                                        description = stringResource(R.string.nav_requires_floating_bar),
-                                        checked = useBackdropInput,
-                                        onCheckedChange = {
-                                            useBackdropInput = it
-                                            useBackdrop = it
+                            item(animatedVisibility = useFloatingInput) {
+                                SwitchWidget(
+                                    iconPlaceholder = false,
+                                    title = stringResource(R.string.nav_use_liquid_glass),
+                                    checked = useBackdropInput,
+                                    onCheckedChange = {
+                                        useBackdropInput = it
+                                        useBackdrop = it
+                                    },
+                                )
+                            }
+                            item(animatedVisibility = useFloatingInput && useBackdropInput) {
+                                SwitchWidget(
+                                    iconPlaceholder = false,
+                                    title = stringResource(R.string.nav_dynamic_gravity_highlight),
+                                    description = stringResource(R.string.nav_dynamic_gravity_highlight_summary),
+                                    checked = dynamicGravityHighlightInput,
+                                    onCheckedChange = {
+                                        dynamicGravityHighlightInput = it
+                                        dynamicGravityHighlight = it
+                                    },
+                                )
+                            }
+                            item(animatedVisibility = useFloatingInput && useBackdropInput) {
+                                BaseItemContainer {
+                                    val radius = blurRadiusInput.roundToInt()
+                                    IntNumberPickerWidget(
+                                        title = stringResource(R.string.nav_blur_radius),
+                                        value = radius,
+                                        startInt = MIN_BLUR_RADIUS,
+                                        endInt = MAX_BLUR_RADIUS,
+                                        stepSize = 1,
+                                        valueSuffix = "px",
+                                        onValueChange = {
+                                            blurRadiusInput = it.toFloat()
+                                            blurRadius = it
                                         },
                                     )
-                                },
-                                bottomContent = {
-                                    BaseItemContainer {
-                                        val radius = blurRadiusInput.roundToInt()
-                                        IntNumberPickerWidget(
-                                            title = stringResource(R.string.nav_blur_radius),
-                                            value = radius,
-                                            startInt = MIN_BLUR_RADIUS,
-                                            endInt = MAX_BLUR_RADIUS,
-                                            stepSize = 1,
-                                            valueSuffix = "px",
-                                            onValueChange = {
-                                                blurRadiusInput = it.toFloat()
-                                                blurRadius = it
-                                            },
-                                        )
-                                    }
-                                },
-                            )
-                            item {
+                                }
+                            }
+                            item(animatedVisibility = useFloatingInput) {
                                 SwitchWidget(
                                     iconPlaceholder = false,
                                     title = stringResource(R.string.nav_hide_labels),
-                                    description = stringResource(R.string.nav_requires_floating_bar),
                                     checked = hideLabelsInput,
                                     onCheckedChange = {
                                         hideLabelsInput = it

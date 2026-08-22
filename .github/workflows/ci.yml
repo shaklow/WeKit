@@ -20,6 +20,11 @@ on:
       - '.gitignore'
       - '.idea/**'
   workflow_dispatch:
+    inputs:
+      publish_extensions:
+        description: Build and publish all extension packs, including the large Arch rootfs
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -69,6 +74,21 @@ jobs:
           test -x "$NDK_BIN/aarch64-linux-android$MIN_SDK-clang"
           test -x "$NDK_BIN/armv7a-linux-androideabi$MIN_SDK-clang"
           test -x "$NDK_BIN/llvm-strip"
+
+      - name: Prepare PRoot cache key
+        id: proot_cache_inputs
+        run: |
+          echo "commit=$(git -C third_party/proot-static rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "ndk=$(sed -n 's/^ndk = \"\(.*\)\"/\1/p' gradle/libs.versions.toml)" >> "$GITHUB_OUTPUT"
+          echo "min_sdk=$(sed -n 's/^minSdk = \"\(.*\)\"/\1/p' gradle/libs.versions.toml)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache PRoot build
+        uses: actions/cache@v6
+        with:
+          path: target/proot-static
+          key: proot-${{ runner.os }}-${{ runner.arch }}-${{ steps.proot_cache_inputs.outputs.commit }}-${{ steps.proot_cache_inputs.outputs.ndk }}-${{ steps.proot_cache_inputs.outputs.min_sdk }}-${{ hashFiles('patches/proot/android-ptrace-events.patch', 'third_party/proot-static/tools/build-static-aarch64.sh') }}
+          restore-keys: |
+            proot-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -416,9 +436,8 @@ jobs:
 
   build-extensions:
     runs-on: ubuntu-latest
-    # Publishing is push-only to master/dev: pull_request jobs must never touch
-    # the persistent Extensions release or create attestations.
-    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/dev') }}
+    # This dedicated publishing job is the only path that downloads the Arch rootfs.
+    if: ${{ (github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/dev')) || (github.event_name == 'workflow_dispatch' && inputs.publish_extensions) }}
     permissions:
       contents: write
       id-token: write
@@ -439,14 +458,18 @@ jobs:
           cache: gradle
 
       - name: Set up Rust
-        # xtask is host-only Rust; the Android targets/nightly channel used by
-        # the build job are not needed here.
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
 
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
           go-version-file: app/src/main/go/wekit-cloudflared/go.mod
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y gcc-multilib
 
       - name: Grant execute permission
         run: chmod +x gradlew
@@ -462,9 +485,48 @@ jobs:
           test -x "$NDK_BIN/armv7a-linux-androideabi$MIN_SDK-clang"
           test -x "$NDK_BIN/llvm-strip"
 
-      - name: Build packs
+      - name: Prepare PRoot cache key
+        id: proot_cache_inputs
         run: |
+          echo "commit=$(git -C third_party/proot-static rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "ndk=$(sed -n 's/^ndk = \"\(.*\)\"/\1/p' gradle/libs.versions.toml)" >> "$GITHUB_OUTPUT"
+          echo "min_sdk=$(sed -n 's/^minSdk = \"\(.*\)\"/\1/p' gradle/libs.versions.toml)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache PRoot build
+        uses: actions/cache@v6
+        with:
+          path: target/proot-static
+          key: proot-${{ runner.os }}-${{ runner.arch }}-${{ steps.proot_cache_inputs.outputs.commit }}-${{ steps.proot_cache_inputs.outputs.ndk }}-${{ steps.proot_cache_inputs.outputs.min_sdk }}-${{ hashFiles('patches/proot/android-ptrace-events.patch', 'third_party/proot-static/tools/build-static-aarch64.sh') }}
+          restore-keys: |
+            proot-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build packs
+        env:
+          WEKIT_ARCH_ROOTFS: ${{ runner.temp }}/arch-pack/ArchLinuxARM-aarch64-rootfs.tar.gz
+        run: |
+          SOURCE=extensions/archlinux-arm64-sources.json
+          ROOTFS_URL=$(jq -r '.rootfs.url' "$SOURCE")
+          ROOTFS_MD5=$(jq -r '.rootfs.md5' "$SOURCE")
+          ROOTFS_SHA256=$(jq -er '.rootfs.sha256 | select(test("^[0-9A-Fa-f]{64}$"))' "$SOURCE")
+          ROOTFS_SIGNATURE_URL=$(jq -r '.rootfs.signature_url' "$SOURCE")
+          SIGNING_FINGERPRINT=$(jq -r '.rootfs.signing_fingerprint' "$SOURCE")
+          mkdir -p "$RUNNER_TEMP/arch-pack"
+          curl --fail --location --retry 3 \
+            "$ROOTFS_URL" \
+            -o "$WEKIT_ARCH_ROOTFS"
+          printf '%s  %s\n' "$ROOTFS_SHA256" "$WEKIT_ARCH_ROOTFS" | sha256sum --check --strict
+          printf '%s  %s\n' "$ROOTFS_MD5" "$WEKIT_ARCH_ROOTFS" | md5sum --check --strict
+          curl --fail --location --retry 3 \
+            "$ROOTFS_SIGNATURE_URL" \
+            -o "$WEKIT_ARCH_ROOTFS.sig"
+          curl --fail --location --retry 3 \
+            "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x$SIGNING_FINGERPRINT" \
+            -o "$RUNNER_TEMP/arch-pack/signing-key.asc"
+          test "$(gpg --show-keys --with-colons "$RUNNER_TEMP/arch-pack/signing-key.asc" | awk -F: '$1 == "fpr" { print $10; exit }')" = "$SIGNING_FINGERPRINT"
+          gpg --batch --import "$RUNNER_TEMP/arch-pack/signing-key.asc"
+          gpg --batch --verify "$WEKIT_ARCH_ROOTFS.sig" "$WEKIT_ARCH_ROOTFS"
           cargo xtask configure
+          cargo xtask build --native-only --abi arm64-v8a
           cargo xtask extensions pack
 
       - name: Skip if assets already published
@@ -473,7 +535,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           skip=true
-          for f in dist/extensions/script-deps-*.dex dist/extensions/cloudflared-*.zip dist/extensions/manifest.json; do
+          for f in dist/extensions/script-deps-*.dex dist/extensions/cloudflared-*.zip dist/extensions/archlinux-arm64-*.zip dist/extensions/manifest.json; do
             name=$(basename "$f")
             if ! gh release view Extensions --json assets -q '.assets[].name' | grep -qx "$name"; then
               skip=false
@@ -502,6 +564,7 @@ jobs:
           gh release upload Extensions \
             dist/extensions/script-deps-*.dex \
             dist/extensions/cloudflared-*.zip \
+            dist/extensions/archlinux-arm64-*.zip \
             dist/extensions/manifest.json \
             --clobber
 
@@ -512,6 +575,7 @@ jobs:
           subject-path: |
             dist/extensions/script-deps-*.dex
             dist/extensions/cloudflared-*.zip
+            dist/extensions/archlinux-arm64-*.zip
             dist/extensions/manifest.json
 
   release-ci:

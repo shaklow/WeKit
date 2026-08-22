@@ -7,6 +7,7 @@ import android.os.Process
 import com.tencent.mmkv.MMKV
 import dev.ujhhgtg.wekit.extensions.CloudflaredPack
 import dev.ujhhgtg.wekit.extensions.CloudflaredPackNotInstalledException
+import dev.ujhhgtg.wekit.loader.startup.StartupInfo
 import dev.ujhhgtg.wekit.loader.utils.NativeLoader.init
 import dev.ujhhgtg.wekit.preferences.WePrefs
 import dev.ujhhgtg.wekit.utils.fs.createDirsSafe
@@ -26,6 +27,11 @@ object NativeLoader {
     private var zygiskPayload: ZygiskPayload? = null
     private var zygiskNativeLibraries: Map<String, File> = emptyMap()
     private var nativeLibrariesLoaded = false
+    private var materializedInvokeTool: File? = null
+    private var materializedChrootCleanup: File? = null
+    private var packagedProot: File? = null
+    private var packagedProotLoader: File? = null
+    private var installedNativeLibraryDir: File? = null
 
     /**
      * Configures native loading for the copied APK that the FunBox-style
@@ -43,18 +49,25 @@ object NativeLoader {
     }
 
     fun init(hostCtx: Context) {
+        synchronized(nativeLoadLock) {
+            if (zygiskPayload == null) {
+                val instructionSet = if (Process.is64Bit()) "arm64" else "arm"
+                installedNativeLibraryDir = File(
+                    requireNotNull(File(StartupInfo.modulePath).parentFile),
+                    "lib/$instructionSet",
+                ).also {
+                    require(it.isDirectory) { "installed WeKit native-library directory is unavailable: $it" }
+                }
+            }
+        }
         ensureNativeLibrariesLoaded()
         val mmkvDir = hostCtx.filesDir.toPath() / "mmkv"
         if (!mmkvDir.exists()) {
             mmkvDir.createDirsSafe()
         }
 
-        val libLoader = zygiskPayload?.let { zygiskMmkvLibLoader() }
-        if (libLoader == null) {
-            MMKV.initialize(hostCtx, mmkvDir.toString())
-        } else {
-            MMKV.initialize(hostCtx, mmkvDir.toString(), libLoader)
-        }
+        val libLoader = if (zygiskPayload == null) installedMmkvLibLoader() else zygiskMmkvLibLoader()
+        MMKV.initialize(hostCtx, mmkvDir.toString(), libLoader)
 
         MMKV.mmkvWithID(WePrefs.PREFS_NAME, MMKV.MULTI_PROCESS_MODE)
     }
@@ -66,9 +79,9 @@ object NativeLoader {
             }
             val payload = zygiskPayload
             if (payload == null) {
-                // Xposed/Frida paths use the normal installed-APK library lookup.
-                System.loadLibrary("dexkit")
-                System.loadLibrary("wekit_native")
+                System.load(installedNativeLibrary("androidx.graphics.path").absolutePath)
+                System.load(installedNativeLibrary("dexkit").absolutePath)
+                System.load(installedNativeLibrary("wekit_native").absolutePath)
             } else {
                 loadZygiskLibraries(payload)
             }
@@ -104,6 +117,46 @@ object NativeLoader {
         }
     }
 
+    fun invokeToolExecutable(): File = synchronized(nativeLoadLock) {
+        materializedInvokeTool ?: (zygiskNativeLibraries["invoke_tool"]
+            ?: installedExecutable("invoke_tool")).also {
+                materializedInvokeTool = it
+            }
+    }.also { require(it.isFile && it.canExecute()) { "invoke_tool is not executable: $it" } }
+
+    fun chrootCleanupExecutable(): File = synchronized(nativeLoadLock) {
+        materializedChrootCleanup ?: (zygiskNativeLibraries["chroot_cleanup"]
+            ?: installedExecutable("chroot_cleanup")).also {
+                materializedChrootCleanup = it
+            }
+    }.also { require(it.isFile && it.canExecute()) { "chroot_cleanup is not executable: $it" } }
+
+    fun prootExecutable(): File = synchronized(nativeLoadLock) {
+        packagedProot ?: installedExecutable("proot").also { packagedProot = it }
+    }
+
+    fun prootLoaderExecutable(): File = synchronized(nativeLoadLock) {
+        packagedProotLoader ?: installedExecutable("proot_loader").also { packagedProotLoader = it }
+    }
+
+    private fun installedExecutable(name: String): File {
+        return installedNativeArtifact(name).also {
+            require(it.isFile && it.canExecute()) { "$name is not executable: $it" }
+        }
+    }
+
+    private fun installedNativeLibrary(name: String): File {
+        return installedNativeArtifact(name).also {
+            require(it.isFile && it.canRead()) { "$name is not readable: $it" }
+        }
+    }
+
+    private fun installedNativeArtifact(name: String): File {
+        val directory = installedNativeLibraryDir
+            ?: error("packaged $name requires an installed WeKit APK")
+        return File(directory, "lib$name.so")
+    }
+
     /**
      * InMemoryDexClassLoader has no native-library directory on API 28. Match
      * FunBox's workaround: extract packaged libraries into app data, then use
@@ -125,13 +178,15 @@ object NativeLoader {
                 "dexkit" to "libdexkit.so",
                 "mmkv" to "libmmkv.so",
                 "wekit_native" to "libwekit_native.so",
+                "invoke_tool" to "libinvoke_tool.so",
+                "chroot_cleanup" to "libchroot_cleanup.so",
             )
             for (name in names) {
                 val (libraryName, fileName) = name
                 val entry = archive.getEntry("lib/$abi/$fileName") ?: continue
                 val extracted = extractLibrary(archive, entry.name, libraryDir, fileName)
                 libraries[libraryName] = extracted
-                if (libraryName != "mmkv") {
+                if (libraryName != "mmkv" && libraryName != "invoke_tool" && libraryName != "chroot_cleanup") {
                     System.load(extracted.absolutePath)
                 }
             }
@@ -153,6 +208,10 @@ object NativeLoader {
         } else {
             System.loadLibrary(libraryName)
         }
+    }
+
+    private fun installedMmkvLibLoader(): MMKV.LibLoader = MMKV.LibLoader { libraryName ->
+        System.load(installedNativeLibrary(libraryName).absolutePath)
     }
 
     private fun currentProcessAbi(apk: File): String {
