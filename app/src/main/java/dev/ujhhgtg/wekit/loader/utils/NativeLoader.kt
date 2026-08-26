@@ -7,6 +7,8 @@ import android.os.Process
 import com.tencent.mmkv.MMKV
 import dev.ujhhgtg.wekit.extensions.CloudflaredPack
 import dev.ujhhgtg.wekit.extensions.CloudflaredPackNotInstalledException
+import dev.ujhhgtg.wekit.extensions.LlamaNativePack
+import dev.ujhhgtg.wekit.extensions.LlamaPackNotInstalledException
 import dev.ujhhgtg.wekit.loader.startup.StartupInfo
 import dev.ujhhgtg.wekit.loader.utils.NativeLoader.init
 import dev.ujhhgtg.wekit.preferences.WePrefs
@@ -15,6 +17,12 @@ import java.io.File
 import java.util.zip.ZipFile
 import kotlin.io.path.div
 import kotlin.io.path.exists
+
+data class LlamaLaunchFiles(
+    val bootstrapApk: File,
+    val controllerLibrary: File,
+    val childLibrary: File,
+)
 
 object NativeLoader {
 
@@ -115,6 +123,44 @@ object NativeLoader {
             System.load(library.absolutePath)
             cloudflaredLoaded = true
         }
+    }
+
+    @Volatile
+    private var llamaControllerLoaded = false
+
+    /** Whether the base llama controller library has been mapped in this process. */
+    @JvmStatic
+    fun isLlamaLoaded(): Boolean = llamaControllerLoaded
+
+    /**
+     * Resolves every file needed to launch one inference child. The parent
+     * always maps the base library for controller JNI; the fresh app_process
+     * child maps the requested base or OpenCL variant independently.
+     */
+    @JvmStatic
+    @SuppressLint("UnsafeDynamicallyLoadedCode")
+    fun prepareLlamaLaunch(backend: String): LlamaLaunchFiles = synchronized(nativeLoadLock) {
+        val bootstrap = zygiskPayload?.apk ?: File(StartupInfo.modulePath)
+        require(bootstrap.isFile && bootstrap.canRead()) {
+            "llama bootstrap APK is unreadable: $bootstrap"
+        }
+        val base = LlamaNativePack.libraryFile(opencl = false)
+            ?: throw LlamaPackNotInstalledException("llama-native extension pack is not installed")
+        require(base.isFile && base.canRead()) { "llama controller library is unreadable: $base" }
+        val child = if (backend == "opencl") {
+            LlamaNativePack.libraryFile(opencl = true)
+                ?: throw LlamaPackNotInstalledException(
+                    "llama-native OpenCL variant is not installed"
+                )
+        } else {
+            base
+        }
+        require(child.isFile && child.canRead()) { "llama child library is unreadable: $child" }
+        if (!llamaControllerLoaded) {
+            System.load(base.absolutePath)
+            llamaControllerLoaded = true
+        }
+        LlamaLaunchFiles(bootstrap, base, child)
     }
 
     fun invokeToolExecutable(): File = synchronized(nativeLoadLock) {
